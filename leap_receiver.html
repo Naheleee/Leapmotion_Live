@@ -188,6 +188,10 @@
     }
 
     function getHandProjection(hand, senderId) {
+      if (senderId === 'sender1') {
+        return { direct: true };
+      }
+
       var roots = [];
       var tips = [];
       var center = new THREE.Vector3();
@@ -228,8 +232,7 @@
       spread.normalize();
       var normal = extension.clone().cross(spread).normalize();
 
-      var isLeftHand = hand.type === 'left';
-      var targetExtension = new THREE.Vector3(isLeftHand ? 1 : -1, 0, 0);
+      var targetExtension = new THREE.Vector3(1, 0, 0);
       var targetSpread = new THREE.Vector3(0, 0, 1);
       var targetNormal = targetExtension.clone().cross(targetSpread);
       var minHandX = Infinity;
@@ -248,23 +251,22 @@
 
       var sideGap = 48;
       var screenMargin = 24;
-      var sideMin = isLeftHand
-        ? -viewWidth / 2 + screenMargin
-        : sideGap;
-      var sideMax = isLeftHand
-        ? -sideGap
-        : viewWidth / 2 - screenMargin;
+      var sideMin = -viewWidth / 2 + screenMargin;
+      var sideMax = -sideGap;
       var minCenterX = sideMin - minHandX;
       var maxCenterX = sideMax - maxHandX;
-      var desiredCenterX = (isLeftHand ? -1 : 1) * viewWidth * 0.34 +
+      var desiredCenterX = -viewWidth * 0.34 +
         THREE.Math.clamp(center.x * 0.35, -viewWidth * 0.12, viewWidth * 0.12);
       var targetCenterX = minCenterX <= maxCenterX
         ? THREE.Math.clamp(desiredCenterX, minCenterX, maxCenterX)
         : (sideMin + sideMax - minHandX - maxHandX) / 2;
+      var handTypeOffset = hand.type === 'left' ? -140 : 140;
+      if (senderId === 'sender1') handTypeOffset *= -1;
       var targetCenter = new THREE.Vector3(
         targetCenterX,
         center.y,
-        THREE.Math.clamp(center.z * 0.35, -viewHeight * 0.3, viewHeight * 0.3)
+        THREE.Math.clamp(center.z * 0.35, -viewHeight * 0.3, viewHeight * 0.3) +
+          handTypeOffset
       );
 
       return {
@@ -280,6 +282,12 @@
     }
 
     function projectHandPoint(point, projection) {
+      if (projection.direct) {
+        return point.clone()
+          .applyAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2)
+          .add(new THREE.Vector3(viewWidth * 0.34, 0, 0));
+      }
+
       var relative = point.clone().sub(projection.center);
       return projection.targetCenter
         .clone()
