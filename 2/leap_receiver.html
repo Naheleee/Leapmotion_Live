@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Leap Hands</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #10131a;
+      color: #fff;
+      font: 12px/1.4 monospace;
+    }
+
+    #live-data-panel {
+      position: fixed;
+      z-index: 2;
+      box-sizing: border-box;
+      width: min(460px, calc(100vw - 20px));
+      max-height: calc(100vh - 20px);
+      margin: 10px;
+      overflow: auto;
+      padding: 12px;
+      scrollbar-color: #aaa transparent;
+      scrollbar-width: thin;
+    }
+
+    #live-data-panel h2 {
+      margin: 0 0 4px;
+      font: bold 15px/1.3 sans-serif;
+    }
+
+    #connection-status {
+      margin: 0 0 8px;
+      color: green;
+      font: 12px/1.4 sans-serif;
+    }
+
+    #scoreboard {
+      position: fixed;
+      z-index: 2;
+      top: 16px;
+      left: 50%;
+      display: flex;
+      gap: 24px;
+      transform: translateX(-50%);
+      font: bold 24px/1 sans-serif;
+      text-shadow: 0 1px 4px #000;
+      pointer-events: none;
+    }
+
+    #blue-score {
+      color: #668cff;
+    }
+
+    #green-score {
+      color: #65e879;
+    }
+
+    #live-data {
+      margin: 0;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      display: block;
+    }
+  </style>
+  <script src="lib/three.js"></script>
+  <script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
+</head>
+<body>
+  <div id="live-data-panel">
+    <p id="connection-status">Connecting to Ably...</p>
+    <pre id="live-data"></pre>
+  </div>
+  <div id="scoreboard" aria-label="Score">
+    <span id="blue-score">Blue 0</span>
+    <span id="green-score">Green 0</span>
+  </div>
+  <script>
+    var colorsBySender = {
+      sender1: 0x0000ff,
+      sender2: 0x00ff00
+    };
+    var trackedHands = Object.create(null);
+    var senderFrames = Object.create(null);
+    var liveDataElement = document.getElementById('live-data');
+    var connectionStatus = document.getElementById('connection-status');
+    var scene = new THREE.Scene();
+    var renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    var viewHeight = 400;
+    var viewWidth = viewHeight * window.innerWidth / window.innerHeight;
+    var camera = new THREE.OrthographicCamera(
+      -viewWidth / 2,
+      viewWidth / 2,
+      viewHeight / 2,
+      -viewHeight / 2,
+      1,
+      3000
+    );
+
+    renderer.setClearColor(0x000000, 0);
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    document.body.appendChild(renderer.domElement);
+
+    var directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+    directionalLight.position.set(0, 0.5, 1);
+    scene.add(directionalLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+    camera.position.set(0, 1200, 0);
+    camera.up.set(0, 0, -1);
+    camera.lookAt(0, 0, 0);
+    scene.add(camera);
+
+    var joystickInnerRadius = 16;
+    var joystickOuterRadius = 50;
+
+    function makeJoystick(name) {
+      var joystick = new THREE.Mesh(
+        new THREE.RingGeometry(joystickInnerRadius, joystickOuterRadius, 48),
+        new THREE.MeshBasicMaterial({
+          color: 0xff0000,
+          side: THREE.DoubleSide,
+          depthTest: false
+        })
+      );
+      joystick.name = name;
+      joystick.rotation.x = Math.PI / 2;
+      joystick.visible = false;
+      scene.add(joystick);
+      return joystick;
+    }
+
+    var bluejoystick = makeJoystick('bluejoystick');
+    var greenjoystick = makeJoystick('greenjoystick');
+    var joysticks = {
+      sender1: bluejoystick,
+      sender2: greenjoystick
+    };
+    var joystickMotion = {
+      sender1: { physicsInitialized: false },
+      sender2: { physicsInitialized: false }
+    };
+    var puckRadius = 20;
+    var maxPuckSpeed = 280;
+    var maxJoystickSpeed = 180;
+    var wallRestitution = 0.65;
+    var goalLength = Math.min(180, viewHeight * 0.55);
+    var goalThickness = 8;
+    var scores = { blue: 0, green: 0 };
+    var blueScoreElement = document.getElementById('blue-score');
+    var greenScoreElement = document.getElementById('green-score');
+
+    function makeGoal(name, color, side) {
+      var goal = new THREE.Mesh(
+        new THREE.BoxGeometry(goalThickness, 1, goalLength),
+        new THREE.MeshBasicMaterial({ color: color, depthTest: false })
+      );
+      goal.name = name;
+      goal.position.set(
+        side * (viewWidth / 2 - goalThickness / 2),
+        0,
+        0
+      );
+      scene.add(goal);
+      return goal;
+    }
+
+    var leftGoal = makeGoal('blueGoal', 0x0000ff, -1);
+    var rightGoal = makeGoal('greenGoal', 0x00ff00, 1);
+    var puck = new THREE.Mesh(
+      new THREE.CircleGeometry(puckRadius, 48),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
+    );
+    puck.name = 'playball';
+    puck.rotation.x = -Math.PI / 2;
+    scene.add(puck);
+    var puckVelocity = new THREE.Vector3();
+    var lastPhysicsTime = 0;
+
+    function serveBall(side) {
+      var maxX = Math.max(0, viewWidth / 2 - puckRadius);
+      puck.position.set(
+        side * maxX * 0.55,
+        0,
+        (Math.random() - 0.5) * Math.min(60, viewHeight * 0.15)
+      );
+      puckVelocity.set(
+        -side * 170,
+        0,
+        (Math.random() - 0.5) * 70
+      );
+    }
+
+    function awardGoal(side) {
+      if (side < 0) {
+        scores.blue++;
+        blueScoreElement.textContent = 'Blue ' + scores.blue;
+      } else {
+        scores.green++;
+        greenScoreElement.textContent = 'Green ' + scores.green;
+      }
+      serveBall(side);
+    }
+
+    serveBall(Math.random() < 0.5 ? -1 : 1);
+
+    function animatePuck(time) {
+      var deltaTime = lastPhysicsTime
+        ? Math.min((time - lastPhysicsTime) / 1000, 0.05)
+        : 0;
+      lastPhysicsTime = time;
+
+      if (deltaTime) {
+        var previousPuckX = puck.position.x;
+        var previousPuckZ = puck.position.z;
+        puck.position.x += puckVelocity.x * deltaTime;
+        puck.position.z += puckVelocity.z * deltaTime;
+        var maxX = Math.max(0, viewWidth / 2 - puckRadius);
+        var maxZ = Math.max(0, viewHeight / 2 - puckRadius);
+        var scored = false;
+
+        if (
+          puck.position.x <= -maxX &&
+          puck.position.x < previousPuckX &&
+          Math.abs(puck.position.z) <= goalLength / 2 + puckRadius
+        ) {
+          awardGoal(-1);
+          scored = true;
+        } else if (
+          puck.position.x >= maxX &&
+          puck.position.x > previousPuckX &&
+          Math.abs(puck.position.z) <= goalLength / 2 + puckRadius
+        ) {
+          awardGoal(1);
+          scored = true;
+        }
+
+        if (!scored) {
+          Object.keys(joysticks).forEach(function(senderId) {
+            var joystick = joysticks[senderId];
+            var motion = joystickMotion[senderId];
+            if (!joystick.visible) {
+              motion.physicsInitialized = false;
+              return;
+            }
+
+            var previousJoystickX = motion.physicsInitialized
+              ? motion.physicsX
+              : joystick.position.x;
+            var previousJoystickZ = motion.physicsInitialized
+              ? motion.physicsZ
+              : joystick.position.z;
+            var joystickDeltaX = joystick.position.x - previousJoystickX;
+            var joystickDeltaZ = joystick.position.z - previousJoystickZ;
+            motion.physicsX = joystick.position.x;
+            motion.physicsZ = joystick.position.z;
+            motion.physicsInitialized = true;
+
+            var relativeStartX = previousPuckX - previousJoystickX;
+            var relativeStartZ = previousPuckZ - previousJoystickZ;
+            var relativeDeltaX =
+              puck.position.x - joystick.position.x - relativeStartX;
+            var relativeDeltaZ =
+              puck.position.z - joystick.position.z - relativeStartZ;
+            var relativeDeltaLengthSq =
+              relativeDeltaX * relativeDeltaX + relativeDeltaZ * relativeDeltaZ;
+            var closestTime = relativeDeltaLengthSq
+              ? THREE.Math.clamp(
+                -(relativeStartX * relativeDeltaX + relativeStartZ * relativeDeltaZ) /
+                  relativeDeltaLengthSq,
+                0,
+                1
+              )
+              : 0;
+            var closestX = relativeStartX + relativeDeltaX * closestTime;
+            var closestZ = relativeStartZ + relativeDeltaZ * closestTime;
+            var minDistance = puckRadius + joystickOuterRadius;
+
+            if (
+              closestX * closestX + closestZ * closestZ >=
+              minDistance * minDistance
+            ) {
+              return;
+            }
+
+            var normalX = closestX;
+            var normalZ = closestZ;
+            var normalLength = Math.sqrt(normalX * normalX + normalZ * normalZ);
+            if (!normalLength) {
+              normalX = relativeStartX;
+              normalZ = relativeStartZ;
+              normalLength = Math.sqrt(normalX * normalX + normalZ * normalZ);
+            }
+            if (normalLength) {
+              normalX /= normalLength;
+              normalZ /= normalLength;
+            } else {
+              normalX = -relativeDeltaX;
+              normalZ = -relativeDeltaZ;
+              normalLength = Math.sqrt(normalX * normalX + normalZ * normalZ);
+              if (normalLength) {
+                normalX /= normalLength;
+                normalZ /= normalLength;
+              } else {
+                normalX = 1;
+                normalZ = 0;
+              }
+            }
+            puck.position.x = joystick.position.x + normalX * minDistance;
+            puck.position.z = joystick.position.z + normalZ * minDistance;
+
+            var joystickVelocityX = joystickDeltaX / deltaTime;
+            var joystickVelocityZ = joystickDeltaZ / deltaTime;
+            var joystickSpeed = Math.sqrt(
+              joystickVelocityX * joystickVelocityX +
+              joystickVelocityZ * joystickVelocityZ
+            );
+            if (joystickSpeed > maxJoystickSpeed) {
+              var joystickSpeedScale = maxJoystickSpeed / joystickSpeed;
+              joystickVelocityX *= joystickSpeedScale;
+              joystickVelocityZ *= joystickSpeedScale;
+            }
+            var relativeVelocityX = puckVelocity.x - joystickVelocityX;
+            var relativeVelocityZ = puckVelocity.z - joystickVelocityZ;
+            var normalVelocity =
+              relativeVelocityX * normalX + relativeVelocityZ * normalZ;
+
+            if (normalVelocity < 0) {
+              var impulse = 1.35 * normalVelocity;
+              puckVelocity.x -= impulse * normalX;
+              puckVelocity.z -= impulse * normalZ;
+            }
+          });
+        }
+
+        if (!scored) {
+          if (puck.position.x < -maxX) {
+            puck.position.x = -maxX;
+            if (puckVelocity.x < 0) puckVelocity.x *= -wallRestitution;
+          } else if (puck.position.x > maxX) {
+            puck.position.x = maxX;
+            if (puckVelocity.x > 0) puckVelocity.x *= -wallRestitution;
+          }
+          if (puck.position.z < -maxZ) {
+            puck.position.z = -maxZ;
+            if (puckVelocity.z < 0) puckVelocity.z *= -wallRestitution;
+          } else if (puck.position.z > maxZ) {
+            puck.position.z = maxZ;
+            if (puckVelocity.z > 0) puckVelocity.z *= -wallRestitution;
+          }
+        }
+
+        var puckSpeed = Math.sqrt(
+          puckVelocity.x * puckVelocity.x + puckVelocity.z * puckVelocity.z
+        );
+        if (puckSpeed > maxPuckSpeed) {
+          puckVelocity.multiplyScalar(maxPuckSpeed / puckSpeed);
+        }
+
+        var glideFriction = Math.exp(-0.08 * deltaTime);
+        puckVelocity.multiplyScalar(glideFriction);
+      }
+
+      renderer.render(scene, camera);
+      window.requestAnimationFrame(animatePuck);
+    }
+
+    window.requestAnimationFrame(animatePuck);
+
+    function resizeCanvas() {
+      viewWidth = viewHeight * window.innerWidth / window.innerHeight;
+      camera.left = -viewWidth / 2;
+      camera.right = viewWidth / 2;
+      camera.top = viewHeight / 2;
+      camera.bottom = -viewHeight / 2;
+      camera.updateProjectionMatrix();
+      leftGoal.position.x = -viewWidth / 2 + goalThickness / 2;
+      rightGoal.position.x = viewWidth / 2 - goalThickness / 2;
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      Object.keys(senderFrames).forEach(function(senderId) {
+        senderFrames[senderId].hands.forEach(function(hand) {
+          var visual = trackedHands[senderId + ':' + hand.id];
+          if (visual) updateHandVisual(visual, hand, senderId);
+        });
+      });
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', resizeCanvas, false);
+    resizeCanvas();
+
+    function isVector(value, size) {
+      return Array.isArray(value) &&
+        value.length >= size &&
+        value.slice(0, size).every(function(number) {
+          return typeof number === 'number' && isFinite(number);
+        });
+    }
+
+    function isValidHand(hand) {
+      return hand &&
+        (typeof hand.id === 'number' || typeof hand.id === 'string') &&
+        Array.isArray(hand.fingers) &&
+        hand.fingers.every(function(finger) {
+          return finger && Array.isArray(finger.bones) &&
+            finger.bones.every(function(bone) {
+              return bone &&
+                isVector(bone.prevJoint, 3) &&
+                isVector(bone.nextJoint, 3);
+            });
+        });
+    }
+
+    function makeHandVisual(senderId, hand) {
+      var color = colorsBySender[senderId];
+      var group = new THREE.Object3D();
+      var material = new THREE.MeshPhongMaterial({
+        color: color,
+        emissive: color
+      });
+      var fingerVisuals = [];
+
+      hand.fingers.forEach(function(finger) {
+        var boneMeshes = [];
+        var jointMeshes = [];
+
+        finger.bones.forEach(function(bone) {
+          var mesh = new THREE.Mesh(
+            new THREE.CylinderGeometry(5, 5, 1),
+            material
+          );
+          group.add(mesh);
+          boneMeshes.push(mesh);
+        });
+
+        for (var index = 0; index <= finger.bones.length; index++) {
+          var joint = new THREE.Mesh(
+            new THREE.SphereGeometry(index === finger.bones.length ? 8 : 4),
+            material
+          );
+          group.add(joint);
+          jointMeshes.push(joint);
+        }
+
+        fingerVisuals.push({
+          boneMeshes: boneMeshes,
+          jointMeshes: jointMeshes
+        });
+      });
+
+      scene.add(group);
+      return {
+        group: group,
+        material: material,
+        fingerVisuals: fingerVisuals
+      };
+    }
+
+    function getHandProjection(hand, senderId) {
+      if (senderId === 'sender1' || senderId === 'sender2') {
+        return {
+          direct: true,
+          rotation: senderId === 'sender1' ? Math.PI / 2 : -Math.PI / 2,
+          offsetX: (senderId === 'sender1' ? 1 : -1) * viewWidth * 0.34
+        };
+      }
+
+      var roots = [];
+      var tips = [];
+      var center = new THREE.Vector3();
+      var jointCount = 0;
+
+      hand.fingers.forEach(function(finger) {
+        if (!finger.bones.length) return;
+
+        var firstBone = finger.bones[0];
+        var lastBone = finger.bones[finger.bones.length - 1];
+        roots.push(new THREE.Vector3().fromArray(firstBone.prevJoint));
+        tips.push(new THREE.Vector3().fromArray(lastBone.nextJoint));
+
+        finger.bones.forEach(function(bone) {
+          center.add(new THREE.Vector3().fromArray(bone.prevJoint));
+          jointCount++;
+        });
+        center.add(new THREE.Vector3().fromArray(lastBone.nextJoint));
+        jointCount++;
+      });
+
+      if (!jointCount || !roots.length) return null;
+      center.multiplyScalar(1 / jointCount);
+
+      var extension = new THREE.Vector3();
+      var spread = new THREE.Vector3();
+      roots.forEach(function(root, index) {
+        extension.add(tips[index].clone().sub(root));
+      });
+      extension.normalize();
+      spread.copy(roots[roots.length - 1]).sub(roots[0]);
+      spread.addScaledVector(extension, -spread.dot(extension));
+
+      if (extension.lengthSq() < 0.0001) extension.set(0, 0, 1);
+      if (spread.lengthSq() < 0.0001) {
+        spread.set(0, 1, 0).cross(extension);
+      }
+      spread.normalize();
+      var normal = extension.clone().cross(spread).normalize();
+
+      var targetExtension = new THREE.Vector3(1, 0, 0);
+      var targetSpread = new THREE.Vector3(0, 0, 1);
+      var targetNormal = targetExtension.clone().cross(targetSpread);
+      var minHandX = Infinity;
+      var maxHandX = -Infinity;
+
+      hand.fingers.forEach(function(finger) {
+        finger.bones.forEach(function(bone) {
+          [bone.prevJoint, bone.nextJoint].forEach(function(joint) {
+            var relative = new THREE.Vector3().fromArray(joint).sub(center);
+            var mappedX = relative.dot(extension) * targetExtension.x;
+            minHandX = Math.min(minHandX, mappedX);
+            maxHandX = Math.max(maxHandX, mappedX);
+          });
+        });
+      });
+
+      var sideGap = 48;
+      var screenMargin = 24;
+      var sideMin = -viewWidth / 2 + screenMargin;
+      var sideMax = -sideGap;
+      var minCenterX = sideMin - minHandX;
+      var maxCenterX = sideMax - maxHandX;
+      var desiredCenterX = -viewWidth * 0.34 +
+        THREE.Math.clamp(center.x * 0.35, -viewWidth * 0.12, viewWidth * 0.12);
+      var targetCenterX = minCenterX <= maxCenterX
+        ? THREE.Math.clamp(desiredCenterX, minCenterX, maxCenterX)
+        : (sideMin + sideMax - minHandX - maxHandX) / 2;
+      var handTypeOffset = hand.type === 'left' ? -140 : 140;
+      if (senderId === 'sender1') handTypeOffset *= -1;
+      var targetCenter = new THREE.Vector3(
+        targetCenterX,
+        center.y,
+        THREE.Math.clamp(center.z * 0.35, -viewHeight * 0.3, viewHeight * 0.3) +
+          handTypeOffset
+      );
+
+      return {
+        center: center,
+        extension: extension,
+        spread: spread,
+        normal: normal,
+        targetCenter: targetCenter,
+        targetExtension: targetExtension,
+        targetSpread: targetSpread,
+        targetNormal: targetNormal
+      };
+    }
+
+    function projectHandPoint(point, projection) {
+      if (projection.direct) {
+        return point.clone()
+          .applyAxisAngle(new THREE.Vector3(0, 1, 0), projection.rotation)
+          .add(new THREE.Vector3(projection.offsetX, 0, 0));
+      }
+
+      var relative = point.clone().sub(projection.center);
+      return projection.targetCenter
+        .clone()
+        .addScaledVector(projection.targetExtension, relative.dot(projection.extension))
+        .addScaledVector(projection.targetSpread, relative.dot(projection.spread))
+        .addScaledVector(projection.targetNormal, relative.dot(projection.normal));
+    }
+
+    function updateHandVisual(visual, hand, senderId) {
+      var projection = getHandProjection(hand, senderId);
+      if (!projection) {
+        visual.group.visible = false;
+        return;
+      }
+      visual.group.visible = true;
+
+      hand.fingers.forEach(function(finger, fingerIndex) {
+        var fingerVisual = visual.fingerVisuals[fingerIndex];
+        if (!fingerVisual) return;
+
+        if (finger.type === 0 && finger.bones.length) {
+          var lastThumbBone = finger.bones[finger.bones.length - 1];
+          var joystick = joysticks[senderId];
+          var thumbTip = projectHandPoint(
+            new THREE.Vector3().fromArray(lastThumbBone.nextJoint),
+            projection
+          );
+          joystick.position.copy(thumbTip);
+          joystick.visible = true;
+        }
+
+        finger.bones.forEach(function(bone, boneIndex) {
+          var mesh = fingerVisual.boneMeshes[boneIndex];
+          if (!mesh) return;
+
+          var start = projectHandPoint(
+            new THREE.Vector3().fromArray(bone.prevJoint),
+            projection
+          );
+          var end = projectHandPoint(
+            new THREE.Vector3().fromArray(bone.nextJoint),
+            projection
+          );
+          var direction = end.clone().sub(start);
+          var length = direction.length();
+          mesh.position.copy(start).add(end).multiplyScalar(0.5);
+          mesh.quaternion.setFromUnitVectors(
+            new THREE.Vector3(0, 1, 0),
+            direction.normalize()
+          );
+          mesh.scale.y = length;
+
+          fingerVisual.jointMeshes[boneIndex].position.copy(start);
+        });
+
+        var lastBone = finger.bones[finger.bones.length - 1];
+        if (lastBone && fingerVisual.jointMeshes.length) {
+          fingerVisual.jointMeshes[fingerVisual.jointMeshes.length - 1]
+            .position.copy(projectHandPoint(
+              new THREE.Vector3().fromArray(lastBone.nextJoint),
+              projection
+            ));
+        }
+      });
+    }
+
+    function removeHandVisual(key) {
+      var visual = trackedHands[key];
+      if (!visual) return;
+
+      scene.remove(visual.group);
+      visual.fingerVisuals.forEach(function(fingerVisual) {
+        fingerVisual.boneMeshes.forEach(function(mesh) {
+          mesh.geometry.dispose();
+        });
+        fingerVisual.jointMeshes.forEach(function(mesh) {
+          mesh.geometry.dispose();
+        });
+      });
+      visual.material.dispose();
+      delete trackedHands[key];
+    }
+
+    function updateLiveData() {
+      var handCounts = {
+        sender1: senderFrames.sender1 ? senderFrames.sender1.hands.length : 0,
+        sender2: senderFrames.sender2 ? senderFrames.sender2.hands.length : 0
+      };
+      var senders = Object.keys(senderFrames);
+
+      connectionStatus.textContent =
+        'Ably connected | Blue sender: ' + handCounts.sender1 +
+        ' hands | Green sender: ' + handCounts.sender2 + ' hands';
+
+      liveDataElement.textContent = senders.length
+        ? ''
+        : 'Waiting for Leap Motion data...';
+
+      renderer.render(scene, camera);
+    }
+
+    function handleFrame(message) {
+      var frame = message.data;
+      if (
+        !frame ||
+        !Object.prototype.hasOwnProperty.call(colorsBySender, frame.senderId) ||
+        !Array.isArray(frame.hands)
+      ) {
+        console.warn('Ignoring invalid Leap Motion frame:', frame);
+        return;
+      }
+
+      var hands = frame.hands.filter(function(hand) {
+        if (!isValidHand(hand)) {
+          console.warn('Ignoring invalid Leap Motion hand:', hand);
+          return false;
+        }
+        return true;
+      });
+      var senderId = frame.senderId;
+      var seenHands = Object.create(null);
+      joysticks[senderId].visible = false;
+
+      hands.forEach(function(hand) {
+        var key = senderId + ':' + hand.id;
+        seenHands[key] = true;
+        if (!trackedHands[key]) {
+          trackedHands[key] = makeHandVisual(senderId, hand);
+        }
+        updateHandVisual(trackedHands[key], hand, senderId);
+      });
+
+      Object.keys(trackedHands).forEach(function(key) {
+        if (key.indexOf(senderId + ':') === 0 && !seenHands[key]) {
+          removeHandVisual(key);
+        }
+      });
+
+      senderFrames[senderId] = {
+        receivedAt: Date.now(),
+        hands: hands
+      };
+      updateLiveData();
+    }
+
+    var ablyClient = new Ably.Realtime(
+      "xO6zTg.qhdvvA:VBoolt4nyrt_7TIdvV9stu_2dQ4SirK-bgkR4Buys-0"
+    );
+    var handChannel = ablyClient.channels.get('leap-hands');
+
+    ablyClient.connection.on('connected', function() {
+      connectionStatus.textContent = 'Ably connected | Waiting for hands...';
+    });
+    ablyClient.connection.on('failed', function(stateChange) {
+      connectionStatus.textContent = 'Ably connection failed';
+      console.error('Ably connection failed:', stateChange);
+    });
+    handChannel.subscribe('frame', handleFrame);
+
+    window.setInterval(function() {
+      var staleBefore = Date.now() - 2000;
+      Object.keys(senderFrames).forEach(function(senderId) {
+        if (senderFrames[senderId].receivedAt >= staleBefore) return;
+
+        Object.keys(trackedHands).forEach(function(key) {
+          if (key.indexOf(senderId + ':') === 0) removeHandVisual(key);
+        });
+        joysticks[senderId].visible = false;
+        joystickMotion[senderId].physicsInitialized = false;
+        delete senderFrames[senderId];
+        updateLiveData();
+      });
+    }, 1000);
+  </script>
+</body>
+</html>

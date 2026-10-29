@@ -1,0 +1,415 @@
+<html>
+<head>
+  <title>Bone Hands - Leap</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+    }
+
+    #live-data-panel {
+      position: fixed;
+      z-index: 2;
+      box-sizing: border-box;
+      width: 100%;
+      max-width: calc(100vw - 20px);
+      max-height: calc(100vh - 20px);
+      overflow: auto;
+      padding: 12px;
+      color: black;
+      font: 12px/1.4 monospace;
+      scrollbar-color: black transparent;
+      scrollbar-width: thin;
+    }
+
+    #live-data-panel::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    #live-data-panel h2 {
+      margin: 0 0 8px;
+      font: bold 15px/1.3 sans-serif;
+      font-weight: bold;
+    }
+
+    #live-data {
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+
+    canvas {
+      background: green;
+    }
+  </style>
+  <script src="lib/leap-1.1.1.min.js"></script>
+  <script src="lib/leap-plugins-0.1.6.js"></script>
+  <script src="lib/three.js"></script>
+  <script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
+
+</head>
+<body>
+<div id="live-data-panel">
+  <h2>Live Hand Data</h2>
+  <p>
+  Move Hand over Leap to see bones and bone basis.
+</p>
+  <pre id="live-data">Waiting for Leap Motion data...</pre>
+</div>
+
+</body>
+
+<script>
+// note: before implementing based off of this, you can instead grab the boneHand plugin, which does this all for you,
+// better than the way it is done here.
+// https://developer.leapmotion.com/gallery/bone-hands
+// If you prefer to see exactly how it all works, read on..
+
+  var colors = [0xff0000, 0x00ff00, 0x0000ff];
+  var baseBoneRotation = (new THREE.Quaternion).setFromEuler(
+      new THREE.Euler(Math.PI / 2, 0, 0)
+  );
+
+  // Hand coordinates use millimeters; rotations are in radians.
+  var handPosition = new THREE.Vector3(0, 0, 0);
+  var handRotation = new THREE.Euler(0, 0, 0);
+  var handScale = new THREE.Vector3(1, 1, 1);
+  var cameraPosition = new THREE.Vector3(0, 100, 400);
+  var cameraRotation = new THREE.Euler(Math.atan2(100, 500), 0, 0);
+  var cameraScale = new THREE.Vector3(1, 1, 1);
+  var trackedHands = Object.create(null);
+  var liveDataElement = document.getElementById('live-data');
+  var senderId = 'sender2';
+  var handChannel = new Ably.Realtime(
+    "xO6zTg.qhdvvA:VBoolt4nyrt_7TIdvV9stu_2dQ4SirK-bgkR4Buys-0"
+  ).channels.get('leap-hands');
+  var publishTimer = null;
+  var lastPublishedAt = 0;
+
+  var serializeHand = function(hand) {
+    return {
+      id: hand.id,
+      type: hand.type,
+      fingers: hand.fingers.map(function(finger) {
+        return {
+          type: finger.type,
+          bones: finger.bones.map(function(bone) {
+            return {
+              type: bone.type,
+              length: bone.length,
+              prevJoint: Array.prototype.slice.call(bone.prevJoint),
+              nextJoint: Array.prototype.slice.call(bone.nextJoint)
+            };
+          })
+        };
+      })
+    };
+  };
+
+  var publishHandFrame = function() {
+    if (publishTimer !== null) return;
+
+    var delay = Math.max(0, 40 - (Date.now() - lastPublishedAt));
+    publishTimer = window.setTimeout(function() {
+      publishTimer = null;
+      lastPublishedAt = Date.now();
+
+      var payload = {
+        senderId: senderId,
+        hands: Object.keys(trackedHands).map(function(id) {
+          return serializeHand(trackedHands[id]);
+        })
+      };
+
+      handChannel.publish('frame', payload).catch(function(error) {
+        console.error('Unable to publish Leap Motion frame:', error);
+      });
+    }, delay);
+  };
+
+  var formatLiveValue = function(value, wholeNumber) {
+    if (value === undefined) return 'unavailable';
+    if (value === null) return 'none';
+    if (typeof value === 'number') {
+      if (!isFinite(value) || wholeNumber || Math.floor(value) === value) {
+        return String(wholeNumber ? Math.round(value) : value);
+      }
+      return value.toFixed(2);
+    }
+    if (Array.isArray(value) || (typeof value !== 'string' && typeof value.length === 'number')) {
+      return '[' + Array.prototype.slice.call(value).map(formatLiveValue).join(', ') + ']';
+    }
+    return String(value);
+  };
+
+  var appendDataSection = function(lines, title, values) {
+    lines.push(title);
+    values.forEach(function(entry) {
+      lines.push('  ' + entry[0] + ': ' + formatLiveValue(entry[1], entry[2]));
+    });
+  };
+
+  var appendBoneData = function(lines, title, bone) {
+    if (!bone) {
+      lines.push(title + ': unavailable');
+      return;
+    }
+
+    appendDataSection(lines, title, [
+      ['type', bone.type],
+      ['width (mm)', bone.width],
+      ['length (mm)', bone.length],
+      ['previous joint (mm)', bone.prevJoint],
+      ['next joint (mm)', bone.nextJoint],
+      ['center (mm)', bone.center()],
+      ['direction', bone.direction()],
+      ['basis', bone.basis],
+      ['matrix', bone.matrix()],
+      ['left-handed basis', bone.left()]
+    ]);
+  };
+
+  var updateLiveData = function() {
+    var lines = [];
+    var handIds = Object.keys(trackedHands);
+
+    if (!handIds.length) {
+      liveDataElement.textContent = 'Waiting for Leap Motion data...';
+      return;
+    }
+
+    handIds.forEach(function(id, index) {
+      var hand = trackedHands[id];
+      if (index) lines.push('');
+
+      appendDataSection(lines, 'HAND ' + (index + 1), [
+        ['id', hand.id],
+        ['type', hand.type],
+        ['valid', hand.valid],
+        ['time visible (s)', hand.timeVisible],
+        ['confidence', hand.confidence, true],
+        ['palm position (mm)', hand.palmPosition],
+        ['stabilized palm position (mm)', hand.stabilizedPalmPosition],
+        ['palm velocity (mm/s)', hand.palmVelocity],
+        ['direction', hand.direction],
+        ['palm normal', hand.palmNormal],
+        ['sphere center (mm)', hand.sphereCenter],
+        ['sphere radius (mm)', hand.sphereRadius],
+        ['grab strength', hand.grabStrength, true],
+        ['pinch strength', hand.pinchStrength, true],
+        ['pitch (rad)', hand.pitch()],
+        ['yaw (rad)', hand.yaw()],
+        ['roll (rad)', hand.roll()],
+        ['raw translation', hand._translation],
+        ['raw rotation', hand._rotation],
+        ['raw scale factor', hand._scaleFactor]
+      ]);
+
+      appendBoneData(lines, 'ARM', hand.arm);
+
+      hand.fingers.forEach(function(finger) {
+        var fingerNames = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+        var fingerName = fingerNames[finger.type] || 'finger ' + finger.type;
+
+        appendDataSection(lines, 'FINGER: ' + fingerName, [
+          ['id', finger.id],
+          ['hand id', finger.handId],
+          ['valid', finger.valid],
+          ['extended', finger.extended],
+          ['length (mm)', finger.length],
+          ['width (mm)', finger.width],
+          ['direction', finger.direction],
+          ['tip position (mm)', finger.tipPosition],
+          ['stabilized tip position (mm)', finger.stabilizedTipPosition],
+          ['tip velocity (mm/s)', finger.tipVelocity],
+          ['touch zone', finger.touchZone],
+          ['touch distance', finger.touchDistance],
+          ['time visible (s)', finger.timeVisible],
+          ['carp position (mm)', finger.carpPosition],
+          ['mcp position (mm)', finger.mcpPosition],
+          ['pip position (mm)', finger.pipPosition],
+          ['dip position (mm)', finger.dipPosition],
+          ['joint positions (mm)', finger.positions]
+        ]);
+
+        finger.bones.forEach(function(bone) {
+          var boneNames = ['metacarpal', 'proximal', 'medial', 'distal'];
+          appendBoneData(
+            lines,
+            '  ' + fingerName + ' BONE: ' + (boneNames[bone.type] || bone.type),
+            bone
+          );
+        });
+      });
+    });
+
+    liveDataElement.textContent = lines.join('\n');
+  };
+
+  Leap.loop({background: true}, {
+    hand: function (hand) {
+      trackedHands[hand.id] = hand;
+      updateLiveData();
+      publishHandFrame();
+
+      hand.fingers.forEach(function (finger) {
+
+        // This is the meat of the example - Positioning `the cylinders on every frame:
+        finger.data('boneMeshes').forEach(function(mesh, i){
+          var bone = finger.bones[i];
+
+          mesh.position.fromArray(bone.center());
+
+          mesh.setRotationFromMatrix(
+            (new THREE.Matrix4).fromArray( bone.matrix() )
+          );
+
+          mesh.quaternion.multiply(baseBoneRotation);
+        });
+
+        finger.data('jointMeshes').forEach(function(mesh, i){
+          var bone = finger.bones[i];
+
+          if (bone) {
+            mesh.position.fromArray(bone.prevJoint);
+          }else{
+            // special case for the finger tip joint sphere:
+            bone = finger.bones[i-1];
+            mesh.position.fromArray(bone.nextJoint);
+          }
+
+        });
+
+      });
+
+    renderer.render(scene, camera);
+
+  }})
+    // these two LeapJS plugins, handHold and handEntry are available from leapjs-plugins, included above.
+    // handHold provides hand.data
+    // handEntry provides handFound/handLost events.
+  .use('handHold')
+  .use('handEntry')
+  .on('handFound', function(hand){
+
+    var handGroup = new THREE.Object3D();
+    handGroup.position.copy(handPosition);
+    handGroup.rotation.copy(handRotation);
+    handGroup.scale.copy(handScale);
+    scene.add(handGroup);
+    hand.data('handGroup', handGroup);
+
+    hand.fingers.forEach(function (finger) {
+
+      var boneMeshes = [];
+      var jointMeshes = [];
+
+      finger.bones.forEach(function(bone) {
+
+        // create joints
+
+        // CylinderGeometry(radiusTop, radiusBottom, height, radiusSegments, heightSegments, openEnded)
+        var boneMesh = new THREE.Mesh(
+            new THREE.CylinderGeometry(5, 5, bone.length),
+            new THREE.MeshPhongMaterial()
+        );
+
+        boneMesh.material.color.setHex(0xffffff);
+        handGroup.add(boneMesh);
+        boneMeshes.push(boneMesh);
+      });
+
+      for (var i = 0; i < finger.bones.length + 1; i++) {
+
+        var jointMesh = new THREE.Mesh(
+            new THREE.SphereGeometry(8),
+            new THREE.MeshPhongMaterial()
+        );
+
+        jointMesh.material.color.setHex(0x00ff00);
+        handGroup.add(jointMesh);
+        jointMeshes.push(jointMesh);
+
+      }
+
+
+      finger.data('boneMeshes', boneMeshes);
+      finger.data('jointMeshes', jointMeshes);
+
+    });
+
+  })
+  .on('handLost', function(hand){
+    delete trackedHands[hand.id];
+    updateLiveData();
+    publishHandFrame();
+
+    hand.fingers.forEach(function (finger) {
+
+      finger.data({
+        boneMeshes: null,
+        jointMeshes: null
+      });
+
+    });
+
+    scene.remove(hand.data('handGroup'));
+    hand.data('handGroup', null);
+
+    renderer.render(scene, camera);
+
+  })
+  .connect();
+
+
+  // all units in mm
+  var initScene = function () {
+    window.scene = new THREE.Scene();
+    window.renderer = new THREE.WebGLRenderer({
+      alpha: true
+    });
+
+    window.renderer.setClearColor(0x000000, 0);
+    window.renderer.setPixelRatio(window.devicePixelRatio || 1);
+
+    window.renderer.domElement.style.position = 'fixed';
+    window.renderer.domElement.style.top = 0;
+    window.renderer.domElement.style.left = 0;
+    window.renderer.domElement.style.width = '100%';
+    window.renderer.domElement.style.height = '100%';
+
+    document.body.appendChild(window.renderer.domElement);
+
+    var directionalLight = new THREE.DirectionalLight( 0xffffff, 1 );
+    directionalLight.position.set( 0, 0.5, 1 );
+    window.scene.add(directionalLight);
+
+    window.camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 1000);
+    window.camera.position.copy(cameraPosition);
+    window.camera.rotation.copy(cameraRotation);
+    window.camera.scale.copy(cameraScale);
+
+    var resizeCanvas = function() {
+      var viewportWidth = window.innerWidth;
+      var viewportHeight = window.innerHeight;
+
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
+      camera.aspect = viewportWidth / viewportHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(viewportWidth, viewportHeight);
+      renderer.render(scene, camera);
+    };
+
+    window.addEventListener('resize', resizeCanvas, false);
+
+    scene.add(camera);
+
+
+    resizeCanvas();
+  };
+
+  initScene();
+
+</script>
+</html>
