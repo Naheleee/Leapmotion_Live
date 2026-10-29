@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Leap Hands</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #10131a;
+      color: #fff;
+      font: 12px/1.4 monospace;
+    }
+
+    #live-data-panel {
+      position: fixed;
+      z-index: 2;
+      box-sizing: border-box;
+      width: min(460px, calc(100vw - 20px));
+      max-height: calc(100vh - 20px);
+      margin: 10px;
+      overflow: auto;
+      padding: 12px;
+      background: rgba(16, 19, 26, 0.88);
+      scrollbar-color: #aaa transparent;
+      scrollbar-width: thin;
+    }
+
+    #live-data-panel h2 {
+      margin: 0 0 4px;
+      font: bold 15px/1.3 sans-serif;
+    }
+
+    #connection-status {
+      margin: 0 0 8px;
+      color: #bbb;
+      font: 12px/1.4 sans-serif;
+    }
+
+    #live-data {
+      margin: 0;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      display: block;
+    }
+  </style>
+  <script src="lib/three.js"></script>
+  <script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
+</head>
+<body>
+  <div id="live-data-panel">
+    <h2>Live Hand Data</h2>
+    <p id="connection-status">Connecting to Ably...</p>
+    <pre id="live-data">Waiting for Leap Motion data...</pre>
+  </div>
+  <script>
+    var colorsBySender = {
+      sender1: 0x0000ff,
+      sender2: 0x00ff00
+    };
+    var trackedHands = Object.create(null);
+    var senderFrames = Object.create(null);
+    var liveDataElement = document.getElementById('live-data');
+    var connectionStatus = document.getElementById('connection-status');
+    var scene = new THREE.Scene();
+    var renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    var camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      1,
+      1000
+    );
+
+    renderer.setClearColor(0x000000, 0);
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    document.body.appendChild(renderer.domElement);
+
+    var directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+    directionalLight.position.set(0, 0.5, 1);
+    scene.add(directionalLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+    camera.position.set(0, 100, 400);
+    camera.rotation.set(Math.atan2(100, 500), 0, 0);
+    scene.add(camera);
+
+    function resizeCanvas() {
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', resizeCanvas, false);
+    resizeCanvas();
+
+    function isVector(value, size) {
+      return Array.isArray(value) &&
+        value.length >= size &&
+        value.slice(0, size).every(function(number) {
+          return typeof number === 'number' && isFinite(number);
+        });
+    }
+
+    function isValidHand(hand) {
+      return hand &&
+        (typeof hand.id === 'number' || typeof hand.id === 'string') &&
+        Array.isArray(hand.fingers) &&
+        hand.fingers.every(function(finger) {
+          return finger && Array.isArray(finger.bones) &&
+            finger.bones.every(function(bone) {
+              return bone &&
+                isVector(bone.prevJoint, 3) &&
+                isVector(bone.nextJoint, 3);
+            });
+        });
+    }
+
+    function makeHandVisual(senderId, hand) {
+      var color = colorsBySender[senderId];
+      var group = new THREE.Object3D();
+      var material = new THREE.MeshPhongMaterial({
+        color: color,
+        emissive: color
+      });
+      var fingerVisuals = [];
+
+      hand.fingers.forEach(function(finger) {
+        var boneMeshes = [];
+        var jointMeshes = [];
+
+        finger.bones.forEach(function(bone) {
+          var mesh = new THREE.Mesh(
+            new THREE.CylinderGeometry(5, 5, 1),
+            material
+          );
+          group.add(mesh);
+          boneMeshes.push(mesh);
+        });
+
+        for (var index = 0; index <= finger.bones.length; index++) {
+          var joint = new THREE.Mesh(
+            new THREE.SphereGeometry(8),
+            material
+          );
+          group.add(joint);
+          jointMeshes.push(joint);
+        }
+
+        fingerVisuals.push({
+          boneMeshes: boneMeshes,
+          jointMeshes: jointMeshes
+        });
+      });
+
+      scene.add(group);
+      return {
+        group: group,
+        material: material,
+        fingerVisuals: fingerVisuals
+      };
+    }
+
+    function updateHandVisual(visual, hand) {
+      hand.fingers.forEach(function(finger, fingerIndex) {
+        var fingerVisual = visual.fingerVisuals[fingerIndex];
+        if (!fingerVisual) return;
+
+        finger.bones.forEach(function(bone, boneIndex) {
+          var mesh = fingerVisual.boneMeshes[boneIndex];
+          if (!mesh) return;
+
+          var start = new THREE.Vector3().fromArray(bone.prevJoint);
+          var end = new THREE.Vector3().fromArray(bone.nextJoint);
+          var direction = end.clone().sub(start);
+          var length = direction.length();
+          mesh.position.copy(start).add(end).multiplyScalar(0.5);
+          mesh.quaternion.setFromUnitVectors(
+            new THREE.Vector3(0, 1, 0),
+            direction.normalize()
+          );
+          mesh.scale.y = length;
+
+          fingerVisual.jointMeshes[boneIndex].position.fromArray(
+            bone.prevJoint
+          );
+        });
+
+        var lastBone = finger.bones[finger.bones.length - 1];
+        if (lastBone && fingerVisual.jointMeshes.length) {
+          fingerVisual.jointMeshes[fingerVisual.jointMeshes.length - 1]
+            .position.fromArray(lastBone.nextJoint);
+        }
+      });
+    }
+
+    function removeHandVisual(key) {
+      var visual = trackedHands[key];
+      if (!visual) return;
+
+      scene.remove(visual.group);
+      visual.fingerVisuals.forEach(function(fingerVisual) {
+        fingerVisual.boneMeshes.forEach(function(mesh) {
+          mesh.geometry.dispose();
+        });
+        fingerVisual.jointMeshes.forEach(function(mesh) {
+          mesh.geometry.dispose();
+        });
+      });
+      visual.material.dispose();
+      delete trackedHands[key];
+    }
+
+    function updateLiveData() {
+      var handCounts = {
+        sender1: senderFrames.sender1 ? senderFrames.sender1.hands.length : 0,
+        sender2: senderFrames.sender2 ? senderFrames.sender2.hands.length : 0
+      };
+      var senders = Object.keys(senderFrames);
+
+      connectionStatus.textContent =
+        'Ably connected | Blue sender: ' + handCounts.sender1 +
+        ' hands | Green sender: ' + handCounts.sender2 + ' hands';
+
+      liveDataElement.textContent = senders.length
+        ? JSON.stringify(senderFrames, null, 2)
+        : 'Waiting for Leap Motion data...';
+
+      renderer.render(scene, camera);
+    }
+
+    function handleFrame(message) {
+      var frame = message.data;
+      if (
+        !frame ||
+        !Object.prototype.hasOwnProperty.call(colorsBySender, frame.senderId) ||
+        !Array.isArray(frame.hands)
+      ) {
+        console.warn('Ignoring invalid Leap Motion frame:', frame);
+        return;
+      }
+
+      var hands = frame.hands.filter(function(hand) {
+        if (!isValidHand(hand)) {
+          console.warn('Ignoring invalid Leap Motion hand:', hand);
+          return false;
+        }
+        return true;
+      });
+      var senderId = frame.senderId;
+      var seenHands = Object.create(null);
+
+      hands.forEach(function(hand) {
+        var key = senderId + ':' + hand.id;
+        seenHands[key] = true;
+        if (!trackedHands[key]) {
+          trackedHands[key] = makeHandVisual(senderId, hand);
+        }
+        updateHandVisual(trackedHands[key], hand);
+      });
+
+      Object.keys(trackedHands).forEach(function(key) {
+        if (key.indexOf(senderId + ':') === 0 && !seenHands[key]) {
+          removeHandVisual(key);
+        }
+      });
+
+      senderFrames[senderId] = {
+        receivedAt: Date.now(),
+        hands: hands
+      };
+      updateLiveData();
+    }
+
+    var ablyClient = new Ably.Realtime(
+      "xO6zTg.qhdvvA:VBoolt4nyrt_7TIdvV9stu_2dQ4SirK-bgkR4Buys-0"
+    );
+    var handChannel = ablyClient.channels.get('leap-hands');
+
+    ablyClient.connection.on('connected', function() {
+      connectionStatus.textContent = 'Ably connected | Waiting for hands...';
+    });
+    ablyClient.connection.on('failed', function(stateChange) {
+      connectionStatus.textContent = 'Ably connection failed';
+      console.error('Ably connection failed:', stateChange);
+    });
+    handChannel.subscribe('frame', handleFrame);
+
+    window.setInterval(function() {
+      var staleBefore = Date.now() - 2000;
+      Object.keys(senderFrames).forEach(function(senderId) {
+        if (senderFrames[senderId].receivedAt >= staleBefore) return;
+
+        Object.keys(trackedHands).forEach(function(key) {
+          if (key.indexOf(senderId + ':') === 0) removeHandVisual(key);
+        });
+        delete senderFrames[senderId];
+        updateLiveData();
+      });
+    }, 1000);
+  </script>
+</body>
+</html>
