@@ -293,6 +293,19 @@
             var normalX = closestX;
             var normalZ = closestZ;
             var normalLength = Math.sqrt(normalX * normalX + normalZ * normalZ);
+            var currentOffsetX = puck.position.x - joystick.position.x;
+            var currentOffsetZ = puck.position.z - joystick.position.z;
+            var currentDistance = Math.sqrt(
+              currentOffsetX * currentOffsetX +
+              currentOffsetZ * currentOffsetZ
+            );
+            var overlapping = currentDistance < minDistance;
+            if (overlapping && currentDistance > 0) {
+              normalX = currentOffsetX;
+              normalZ = currentOffsetZ;
+              normalLength = currentDistance;
+            }
+
             if (!normalLength) {
               normalX = relativeStartX;
               normalZ = relativeStartZ;
@@ -313,8 +326,10 @@
                 normalZ = 0;
               }
             }
-            puck.position.x = joystick.position.x + normalX * minDistance;
-            puck.position.z = joystick.position.z + normalZ * minDistance;
+            if (overlapping) {
+              puck.position.x = joystick.position.x + normalX * minDistance;
+              puck.position.z = joystick.position.z + normalZ * minDistance;
+            }
 
             var joystickVelocityX = joystickDeltaX / deltaTime;
             var joystickVelocityZ = joystickDeltaZ / deltaTime;
