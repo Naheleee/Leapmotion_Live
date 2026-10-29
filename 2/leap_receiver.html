@@ -152,6 +152,7 @@
     };
     var puckRadius = 20;
     var maxPuckSpeed = 280;
+    var stoppedPuckSpeed = 5;
     var maxJoystickSpeed = 180;
     var wallRestitution = 0.65;
     var goalLength = Math.min(180, viewHeight * 0.55);
@@ -175,8 +176,8 @@
       return goal;
     }
 
-    var leftGoal = makeGoal('blueGoal', 0x0000ff, -1);
-    var rightGoal = makeGoal('greenGoal', 0x00ff00, 1);
+    var leftGoal = makeGoal('greenGoal', 0x00ff00, -1);
+    var rightGoal = makeGoal('blueGoal', 0x0000ff, 1);
     var puck = new THREE.Mesh(
       new THREE.CircleGeometry(puckRadius, 48),
       new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
@@ -195,19 +196,19 @@
         (Math.random() - 0.5) * Math.min(60, viewHeight * 0.15)
       );
       puckVelocity.set(
-        -side * 170,
+        -side * 240,
         0,
-        (Math.random() - 0.5) * 70
+        (Math.random() - 0.5) * 50
       );
     }
 
     function awardGoal(side) {
       if (side < 0) {
-        scores.blue++;
-        blueScoreElement.textContent = 'Blue ' + scores.blue;
-      } else {
         scores.green++;
         greenScoreElement.textContent = 'Green ' + scores.green;
+      } else {
+        scores.blue++;
+        blueScoreElement.textContent = 'Blue ' + scores.blue;
       }
       serveBall(side);
     }
@@ -367,8 +368,11 @@
           puckVelocity.multiplyScalar(maxPuckSpeed / puckSpeed);
         }
 
-        var glideFriction = Math.exp(-0.08 * deltaTime);
+        var glideFriction = Math.exp(-0.35 * deltaTime);
         puckVelocity.multiplyScalar(glideFriction);
+        if (puckVelocity.length() < stoppedPuckSpeed) {
+          puckVelocity.set(0, 0, 0);
+        }
       }
 
       renderer.render(scene, camera);
