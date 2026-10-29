@@ -72,11 +72,15 @@
     var connectionStatus = document.getElementById('connection-status');
     var scene = new THREE.Scene();
     var renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
-    var camera = new THREE.PerspectiveCamera(
-      45,
-      window.innerWidth / window.innerHeight,
+    var viewHeight = 1000;
+    var viewWidth = viewHeight * window.innerWidth / window.innerHeight;
+    var camera = new THREE.OrthographicCamera(
+      -viewWidth / 2,
+      viewWidth / 2,
+      viewHeight / 2,
+      -viewHeight / 2,
       1,
-      1000
+      3000
     );
 
     renderer.setClearColor(0x000000, 0);
@@ -88,15 +92,28 @@
     scene.add(directionalLight);
     scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 
-    camera.position.set(0, 100, 400);
-    camera.rotation.set(Math.atan2(100, 500), 0, 0);
+    camera.position.set(0, 1200, 0);
+    camera.up.set(0, 0, -1);
+    camera.lookAt(0, 0, 0);
     scene.add(camera);
 
     function resizeCanvas() {
-      renderer.setPixelRatio(window.devicePixelRatio || 1);
-      camera.aspect = window.innerWidth / window.innerHeight;
+      viewWidth = viewHeight * window.innerWidth / window.innerHeight;
+      camera.left = -viewWidth / 2;
+      camera.right = viewWidth / 2;
+      camera.top = viewHeight / 2;
+      camera.bottom = -viewHeight / 2;
       camera.updateProjectionMatrix();
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
       renderer.setSize(window.innerWidth, window.innerHeight);
+
+      Object.keys(senderFrames).forEach(function(senderId) {
+        senderFrames[senderId].hands.forEach(function(hand) {
+          var visual = trackedHands[senderId + ':' + hand.id];
+          if (visual) updateHandVisual(visual, hand, senderId);
+        });
+      });
+
       renderer.render(scene, camera);
     }
 
@@ -170,7 +187,115 @@
       };
     }
 
-    function updateHandVisual(visual, hand) {
+    function getHandProjection(hand, senderId) {
+      var roots = [];
+      var tips = [];
+      var center = new THREE.Vector3();
+      var jointCount = 0;
+
+      hand.fingers.forEach(function(finger) {
+        if (!finger.bones.length) return;
+
+        var firstBone = finger.bones[0];
+        var lastBone = finger.bones[finger.bones.length - 1];
+        roots.push(new THREE.Vector3().fromArray(firstBone.prevJoint));
+        tips.push(new THREE.Vector3().fromArray(lastBone.nextJoint));
+
+        finger.bones.forEach(function(bone) {
+          center.add(new THREE.Vector3().fromArray(bone.prevJoint));
+          jointCount++;
+        });
+        center.add(new THREE.Vector3().fromArray(lastBone.nextJoint));
+        jointCount++;
+      });
+
+      if (!jointCount || !roots.length) return null;
+      center.multiplyScalar(1 / jointCount);
+
+      var extension = new THREE.Vector3();
+      var spread = new THREE.Vector3();
+      roots.forEach(function(root, index) {
+        extension.add(tips[index].clone().sub(root));
+      });
+      extension.normalize();
+      spread.copy(roots[roots.length - 1]).sub(roots[0]);
+      spread.addScaledVector(extension, -spread.dot(extension));
+
+      if (extension.lengthSq() < 0.0001) extension.set(0, 0, 1);
+      if (spread.lengthSq() < 0.0001) {
+        spread.set(0, 1, 0).cross(extension);
+      }
+      spread.normalize();
+      var normal = extension.clone().cross(spread).normalize();
+
+      var isLeftHand = hand.type === 'left';
+      var targetExtension = new THREE.Vector3(isLeftHand ? 1 : -1, 0, 0);
+      var targetSpread = new THREE.Vector3(0, 0, 1);
+      var targetNormal = targetExtension.clone().cross(targetSpread);
+      var minHandX = Infinity;
+      var maxHandX = -Infinity;
+
+      hand.fingers.forEach(function(finger) {
+        finger.bones.forEach(function(bone) {
+          [bone.prevJoint, bone.nextJoint].forEach(function(joint) {
+            var relative = new THREE.Vector3().fromArray(joint).sub(center);
+            var mappedX = relative.dot(extension) * targetExtension.x;
+            minHandX = Math.min(minHandX, mappedX);
+            maxHandX = Math.max(maxHandX, mappedX);
+          });
+        });
+      });
+
+      var sideGap = 48;
+      var screenMargin = 24;
+      var sideMin = isLeftHand
+        ? -viewWidth / 2 + screenMargin
+        : sideGap;
+      var sideMax = isLeftHand
+        ? -sideGap
+        : viewWidth / 2 - screenMargin;
+      var minCenterX = sideMin - minHandX;
+      var maxCenterX = sideMax - maxHandX;
+      var desiredCenterX = (isLeftHand ? -1 : 1) * viewWidth * 0.34 +
+        THREE.Math.clamp(center.x * 0.35, -viewWidth * 0.12, viewWidth * 0.12);
+      var targetCenterX = minCenterX <= maxCenterX
+        ? THREE.Math.clamp(desiredCenterX, minCenterX, maxCenterX)
+        : (sideMin + sideMax - minHandX - maxHandX) / 2;
+      var targetCenter = new THREE.Vector3(
+        targetCenterX,
+        center.y,
+        THREE.Math.clamp(center.z * 0.35, -viewHeight * 0.3, viewHeight * 0.3)
+      );
+
+      return {
+        center: center,
+        extension: extension,
+        spread: spread,
+        normal: normal,
+        targetCenter: targetCenter,
+        targetExtension: targetExtension,
+        targetSpread: targetSpread,
+        targetNormal: targetNormal
+      };
+    }
+
+    function projectHandPoint(point, projection) {
+      var relative = point.clone().sub(projection.center);
+      return projection.targetCenter
+        .clone()
+        .addScaledVector(projection.targetExtension, relative.dot(projection.extension))
+        .addScaledVector(projection.targetSpread, relative.dot(projection.spread))
+        .addScaledVector(projection.targetNormal, relative.dot(projection.normal));
+    }
+
+    function updateHandVisual(visual, hand, senderId) {
+      var projection = getHandProjection(hand, senderId);
+      if (!projection) {
+        visual.group.visible = false;
+        return;
+      }
+      visual.group.visible = true;
+
       hand.fingers.forEach(function(finger, fingerIndex) {
         var fingerVisual = visual.fingerVisuals[fingerIndex];
         if (!fingerVisual) return;
@@ -179,8 +304,14 @@
           var mesh = fingerVisual.boneMeshes[boneIndex];
           if (!mesh) return;
 
-          var start = new THREE.Vector3().fromArray(bone.prevJoint);
-          var end = new THREE.Vector3().fromArray(bone.nextJoint);
+          var start = projectHandPoint(
+            new THREE.Vector3().fromArray(bone.prevJoint),
+            projection
+          );
+          var end = projectHandPoint(
+            new THREE.Vector3().fromArray(bone.nextJoint),
+            projection
+          );
           var direction = end.clone().sub(start);
           var length = direction.length();
           mesh.position.copy(start).add(end).multiplyScalar(0.5);
@@ -190,15 +321,16 @@
           );
           mesh.scale.y = length;
 
-          fingerVisual.jointMeshes[boneIndex].position.fromArray(
-            bone.prevJoint
-          );
+          fingerVisual.jointMeshes[boneIndex].position.copy(start);
         });
 
         var lastBone = finger.bones[finger.bones.length - 1];
         if (lastBone && fingerVisual.jointMeshes.length) {
           fingerVisual.jointMeshes[fingerVisual.jointMeshes.length - 1]
-            .position.fromArray(lastBone.nextJoint);
+            .position.copy(projectHandPoint(
+              new THREE.Vector3().fromArray(lastBone.nextJoint),
+              projection
+            ));
         }
       });
     }
@@ -232,7 +364,7 @@
         ' hands | Green sender: ' + handCounts.sender2 + ' hands';
 
       liveDataElement.textContent = senders.length
-        ? JSON.stringify(senderFrames, null, 2)
+        ? 'Hand bones are displayed in top-down view.'
         : 'Waiting for Leap Motion data...';
 
       renderer.render(scene, camera);
@@ -265,7 +397,7 @@
         if (!trackedHands[key]) {
           trackedHands[key] = makeHandVisual(senderId, hand);
         }
-        updateHandVisual(trackedHands[key], hand);
+        updateHandVisual(trackedHands[key], hand, senderId);
       });
 
       Object.keys(trackedHands).forEach(function(key) {
