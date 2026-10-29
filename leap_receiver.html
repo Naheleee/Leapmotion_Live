@@ -36,7 +36,7 @@
 
     #connection-status {
       margin: 0 0 8px;
-      color: #bbb;
+      color: green;
       font: 12px/1.4 sans-serif;
     }
 
@@ -57,9 +57,8 @@
 </head>
 <body>
   <div id="live-data-panel">
-    <h2>Live Hand Data</h2>
     <p id="connection-status">Connecting to Ably...</p>
-    <pre id="live-data">Waiting for Leap Motion data...</pre>
+    <pre id="live-data"></pre>
   </div>
   <script>
     var colorsBySender = {
@@ -72,7 +71,7 @@
     var connectionStatus = document.getElementById('connection-status');
     var scene = new THREE.Scene();
     var renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
-    var viewHeight = 1000;
+    var viewHeight = 500;
     var viewWidth = viewHeight * window.innerWidth / window.innerHeight;
     var camera = new THREE.OrthographicCamera(
       -viewWidth / 2,
@@ -188,8 +187,12 @@
     }
 
     function getHandProjection(hand, senderId) {
-      if (senderId === 'sender1') {
-        return { direct: true };
+      if (senderId === 'sender1' || senderId === 'sender2') {
+        return {
+          direct: true,
+          rotation: senderId === 'sender1' ? Math.PI / 2 : -Math.PI / 2,
+          offsetX: (senderId === 'sender1' ? 1 : -1) * viewWidth * 0.34
+        };
       }
 
       var roots = [];
@@ -284,8 +287,8 @@
     function projectHandPoint(point, projection) {
       if (projection.direct) {
         return point.clone()
-          .applyAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2)
-          .add(new THREE.Vector3(viewWidth * 0.34, 0, 0));
+          .applyAxisAngle(new THREE.Vector3(0, 1, 0), projection.rotation)
+          .add(new THREE.Vector3(projection.offsetX, 0, 0));
       }
 
       var relative = point.clone().sub(projection.center);
@@ -372,7 +375,7 @@
         ' hands | Green sender: ' + handCounts.sender2 + ' hands';
 
       liveDataElement.textContent = senders.length
-        ? 'Hand bones are displayed in top-down view.'
+        ? ''
         : 'Waiting for Leap Motion data...';
 
       renderer.render(scene, camera);
